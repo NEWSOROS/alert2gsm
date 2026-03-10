@@ -6,6 +6,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"sync"
+
 	log "github.com/sirupsen/logrus"
 
 	"github.com/valyala/fasthttp"
@@ -50,6 +52,7 @@ type HTTPServer struct {
 	Configuration    HTTPServerConfiguration
 	Twilio           Twilio
 	logger           string
+	storageMu        sync.RWMutex
 }
 
 func (server *HTTPServer) Start() {
@@ -71,7 +74,6 @@ func (server *HTTPServer) Start() {
 	}
 
 	if server.Configuration.HTTP.Enabled {
-		// log.Infof("Starting http server at %v", server.Configuration.HTTP.Listen)
 		log.WithFields(log.Fields{
 			"http": server.Configuration.HTTP,
 		}).Info("Starting http server")
@@ -104,8 +106,6 @@ func (server *HTTPServer) Start() {
 				}
 				log.WithFields(log.Fields{
 					"https": server.Configuration.HTTPS,
-					"cert":  cert,
-					"priv":  priv,
 				}).Warn("Starting https server with auto-generated certificate - ssl_certificate or ssl_certificate_key are empty")
 
 				err = tls_server.ListenAndServeTLS(server.Configuration.HTTPS.Listen, "", "")
@@ -144,27 +144,18 @@ func (server *HTTPServer) BasicAuth(next fasthttp.RequestHandler) fasthttp.Reque
 	fn := func(ctx *fasthttp.RequestCtx) {
 		auth := ctx.Request.Header.Peek("Authorization")
 		if bytes.HasPrefix(auth, basicAuthPrefix) {
-			// Check credentials
 			payload, err := base64.StdEncoding.DecodeString(string(auth[len(basicAuthPrefix):]))
 			if err == nil {
 				pair := bytes.SplitN(payload, []byte(":"), 2)
 				if len(pair) == 2 && subtle.ConstantTimeCompare(server.requiredUser, pair[0]) == 1 && subtle.ConstantTimeCompare(server.requiredPassword, pair[1]) == 1 {
-					log.WithFields(log.Fields{
-						"ctx": ctx,
-					}).Debug("Delegate request to the given handle, auth passed")
-
 					next(ctx)
 					return
 				}
 			}
 		}
 
-		log.WithFields(log.Fields{
-			"next": next,
-			"ctx":  ctx,
-		}).Warn("Unauthorized")
+		log.Warn("Unauthorized request")
 
-		// Request Basic Authentication otherwise
 		ctx.Response.Header.Set("WWW-Authenticate", "Basic realm=Restricted")
 		ctx.Error(fasthttp.StatusMessage(fasthttp.StatusUnauthorized), fasthttp.StatusUnauthorized)
 	}
@@ -173,9 +164,7 @@ func (server *HTTPServer) BasicAuth(next fasthttp.RequestHandler) fasthttp.Reque
 }
 
 func (server *HTTPServer) handlerCall(ctx *fasthttp.RequestCtx) {
-	log.WithFields(log.Fields{
-		"ctx": ctx,
-	}).Debug("HTTPServer.handlerCall")
+	log.Debug("HTTPServer.handlerCall")
 
 	msgBytes, _ := twilio.GenerateXML(
 		[]string{
@@ -190,7 +179,10 @@ func (server *HTTPServer) handlerCall(ctx *fasthttp.RequestCtx) {
 func (server *HTTPServer) Notify(msgBytes []byte) {
 	for _, to := range server.Configuration.Webhooks.Twilio.Notify {
 		sid := RandStringRunes(10)
+
+		server.storageMu.Lock()
 		storage[sid] = string(msgBytes)
+		server.storageMu.Unlock()
 
 		queryURL := fmt.Sprintf(
 			"%v/webhook/twilio/%v.xml",
@@ -198,11 +190,10 @@ func (server *HTTPServer) Notify(msgBytes []byte) {
 		)
 
 		log.WithFields(log.Fields{
-			"sid":          sid,
-			"storage[sid]": storage[sid],
-			"queryURL":     queryURL,
-			"to":           to,
-		}).Debug("I putting the call in queue")
+			"sid":      sid,
+			"queryURL": queryURL,
+			"to":       to,
+		}).Debug("Putting the call in queue")
 
 		resp, err := server.Twilio.QueueCall(to, queryURL)
 		if err != nil {
@@ -221,7 +212,6 @@ func (server *HTTPServer) Notify(msgBytes []byte) {
 			continue
 		}
 		logger.Info("the call is queued")
-
 	}
 }
 
@@ -230,45 +220,41 @@ func (server *HTTPServer) getSIDFromPath(path string) (string, error) {
 		"path": path,
 	}).Debug("HTTPServer.getSIDFromPath")
 
-	var (
-		result string
-		err    error
-	)
+	var result string
 
 	reqSID := regexpWebhookTwilio.FindAllStringSubmatch(path, -1)
 
-	if err != nil {
-		return result, err
-	}
 	if len(reqSID) > 0 {
 		if len(reqSID[0]) == 2 {
 			result = reqSID[0][1]
 		}
 	}
-	return result, err
+	return result, nil
 }
 
 func (server *HTTPServer) handlerWebhookTwilio(ctx *fasthttp.RequestCtx) {
 	logger := log.WithFields(log.Fields{
-		"ctx": ctx,
+		"path": string(ctx.Path()),
 	})
 	logger.Debug("HTTPServer.handlerWebhookTwilio")
 
 	sid, err := server.getSIDFromPath(string(ctx.Path()))
 
 	if err != nil {
-		logger.Error("error 400: sid == nil")
+		logger.Error("error 400: invalid sid")
 		ctx.Error(fasthttp.StatusMessage(fasthttp.StatusBadRequest), fasthttp.StatusBadRequest)
 		return
 	}
 
 	if sid == "" {
-		logger.Error("error 400: sid == nil")
+		logger.Error("error 400: empty sid")
 		ctx.Error(fasthttp.StatusMessage(fasthttp.StatusBadRequest), fasthttp.StatusBadRequest)
 		return
 	}
 
+	server.storageMu.RLock()
 	body, exist := storage[sid]
+	server.storageMu.RUnlock()
 
 	if !exist {
 		logger.Errorf("error 404: storage[\"%v\"] not found", sid)
@@ -277,19 +263,18 @@ func (server *HTTPServer) handlerWebhookTwilio(ctx *fasthttp.RequestCtx) {
 	}
 
 	ctx.Response.Header.Set("Content-type", "text/xml")
-	fmt.Fprintf(ctx, body)
+	ctx.SetBodyString(body)
 
 	go func() {
-		logger.Debug("sid removal task stared")
+		server.storageMu.Lock()
 		delete(storage, sid)
-		logger.Debug("sid removal task finished")
+		server.storageMu.Unlock()
 	}()
-
 }
 
 func (server *HTTPServer) handlerWebhookGrafana(ctx *fasthttp.RequestCtx) {
 	logger := log.WithFields(log.Fields{
-		"ctx": ctx,
+		"method": string(ctx.Method()),
 	})
 
 	logger.Debug("HTTPServer.handlerWebhookGrafana")
@@ -318,6 +303,5 @@ func (server *HTTPServer) handlerWebhookGrafana(ctx *fasthttp.RequestCtx) {
 		)
 
 		server.Notify(msgBytes)
-
 	}()
 }

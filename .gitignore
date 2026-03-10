@@ -2,3 +2,7 @@
 vendor
 .env
 config.yml
+alert2gsm
+alert2gsm.exe
+alert2gsm-linux
+alert2gsm-darwin

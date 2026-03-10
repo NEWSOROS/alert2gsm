@@ -3,12 +3,14 @@ package main
 import (
 	"encoding/json"
 	"encoding/xml"
-	log "github.com/sirupsen/logrus"
-	"io/ioutil"
+	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync"
+
+	log "github.com/sirupsen/logrus"
 )
 
 type Twilio struct {
@@ -16,7 +18,7 @@ type Twilio struct {
 	AuthToken  string
 	From       string
 
-	queueLock sync.RWMutex
+	queueLock sync.Mutex
 }
 
 func (t *Twilio) QueueCall(to, xmlURL string) (TwilioResponse, error) {
@@ -46,32 +48,35 @@ func (t *Twilio) QueueCall(to, xmlURL string) (TwilioResponse, error) {
 	req.SetBasicAuth(t.AccountSID, t.AuthToken)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; param=value")
 
-	// lock call queue, only one call scheduling in one time
-	t.queueLock.RLock()
+	// lock call queue, only one call scheduling at a time
+	t.queueLock.Lock()
+	defer t.queueLock.Unlock()
 
 	resp, err = http.DefaultClient.Do(req)
 	if err != nil {
-		t.queueLock.RUnlock()
 		log.Error(err)
 		return answer, err
 	}
 	defer resp.Body.Close()
 
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		t.queueLock.RUnlock()
 		log.Error(err)
 		return answer, err
+	}
+
+	// Check HTTP status before unmarshaling
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		log.Errorf("Twilio API returned status %d: %s", resp.StatusCode, string(body))
+		return answer, fmt.Errorf("twilio API error: status %d", resp.StatusCode)
 	}
 
 	err = json.Unmarshal(body, &answer)
 	if err != nil {
-		t.queueLock.RUnlock()
 		log.Error(err)
 		return answer, err
 	}
 
-	t.queueLock.RUnlock()
 	return answer, nil
 }
 
@@ -89,12 +94,6 @@ func (t *Twilio) GenerateXML(text []string, voice string) ([]byte, error) {
 				Voice: voice,
 			},
 		)
-		// payload.Pause = append(
-		// 	payload.Pause,
-		// 	FormatPause{
-		// 		Length: "1",
-		// 	},
-		// )
 	}
 
 	return xml.MarshalIndent(payload, "", "  ")
@@ -148,7 +147,6 @@ type FormatRequest struct {
 	Say     []FormatSay
 	Text    string `xml:",chardata"`
 	Play    string `xml:"Play,omitempty"`
-	// Pause   []FormatPause `xml:"Pause"`
 }
 
 type FormatPause struct {

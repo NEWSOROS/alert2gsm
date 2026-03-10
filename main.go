@@ -1,14 +1,14 @@
 package main
 
 import (
+	"crypto/rand"
 	"fmt"
-	log "github.com/sirupsen/logrus"
-	"gopkg.in/yaml.v2"
-	"io/ioutil"
-	"math/rand"
+	"math/big"
 	"os"
 	"regexp"
-	"time"
+
+	log "github.com/sirupsen/logrus"
+	"gopkg.in/yaml.v2"
 )
 
 const (
@@ -37,7 +37,8 @@ func RandStringRunes(n int) string {
 	log.Debugf("RandStringRunes(%d)", n)
 	b := make([]rune, n)
 	for i := range b {
-		b[i] = letterRunes[rand.Intn(len(letterRunes))]
+		idx, _ := rand.Int(rand.Reader, big.NewInt(int64(len(letterRunes))))
+		b[i] = letterRunes[idx.Int64()]
 	}
 	return string(b)
 }
@@ -60,29 +61,19 @@ func main() {
 	urlPost = fmt.Sprintf(urlBoilerplate, accountSID)
 
 	regexpWebhookTwilio, err = regexp.Compile(`\/webhook\/twilio\/(.*)\.xml`)
-
 	if err != nil {
 		log.Fatal(err)
 	}
-
-	rand.Seed(time.Now().UnixNano())
 
 	server := HTTPServer{
 		Configuration: HTTPServerConfiguration{},
 		Twilio: Twilio{
 			AccountSID: accountSID,
 			AuthToken:  authToken,
-			// From:       ,
 		},
 	}
 
-	jsonFile, err := os.Open("config.yml")
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer jsonFile.Close()
-
-	byteValue, err := ioutil.ReadAll(jsonFile)
+	byteValue, err := os.ReadFile("config.yml")
 	if err != nil {
 		log.Fatal(err)
 	}
